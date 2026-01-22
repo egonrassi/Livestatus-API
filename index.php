@@ -10,8 +10,16 @@ header('Content-Type: application/json');
 $path = isset($_SERVER['PATH_INFO']) ? $_SERVER['PATH_INFO'] : '';
 $path_parts = explode('/', $path);
 $request_method = $_SERVER['REQUEST_METHOD'];
+$omdPath = $_SERVER['HOME'] . '/tmp/run/live';  // or use OMD_ROOT
+$socket = '/var/nagios/var/rw/live';  // default
+if (file_exists($omdPath)) {
+    $info = @stat($omdPath);
+    if ($info !== false && ($info['mode'] & 0170000) === 0140000) {
+        $socket = $omdPath;
+    }
+}
+$client = new LiveStatusClient($socket);
 
-$client = new LiveStatusClient('/var/nagios/var/rw/live');
 $client->pretty_print = true;
 
 $action = $path_parts[1];
