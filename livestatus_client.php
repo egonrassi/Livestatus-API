@@ -196,7 +196,13 @@ class LiveStatusQuery
         $query = [];
 
         $query[] = "GET {$this->topic}";
-        $this->columns && $query[] = "Columns: " . join($this->columns, ' ');
+        if ($this->columns) {
+                $cols = (array) $this->columns;
+                $cols = array_filter($cols, 'strlen');
+                if ($cols) {
+                   $query[] = "Columns: " . join(' ', $cols);
+                }
+        }
 
         foreach ($this->filters as $filter) {
             $query[] = "Filter: $filter";
@@ -212,7 +218,7 @@ class LiveStatusQuery
 
         $query[] = "\n";
 
-        return join($query, "\n");
+        return is_array($query) ? join("\n", $query) : (string)$query;
 
     }
 }

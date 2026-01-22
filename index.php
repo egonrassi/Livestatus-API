@@ -7,7 +7,8 @@ ini_set('memory_limit', -1);
 
 header('Content-Type: application/json');
 
-$path_parts = explode('/', $_SERVER['PATH_INFO']);
+$path = isset($_SERVER['PATH_INFO']) ? $_SERVER['PATH_INFO'] : '';
+$path_parts = explode('/', $path);
 $request_method = $_SERVER['REQUEST_METHOD'];
 
 $client = new LiveStatusClient('/var/nagios/var/rw/live');
