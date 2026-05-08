@@ -6,17 +6,90 @@ class LiveStatusException extends Exception
 
 class LiveStatusClient
 {
-    function __construct($socket_path)
+    /**
+     * Connect via a Unix domain socket (original behaviour).
+     *
+     *   $client = new LiveStatusClient('/var/nagios/var/rw/live');
+     *
+     * Connect via TCP:
+     *
+     *   $client = new LiveStatusClient('tcp://nagios.example.com:6557');
+     *   $client = new LiveStatusClient('nagios.example.com', 6557);
+     *
+     * The second form (host + port as separate args) is kept for convenience.
+     */
+    function __construct($socket_path_or_host, $tcp_port = null)
     {
-        $this->socket_path = $socket_path;
-        $this->socket = null;
-        $this->query = null;
+        if ($tcp_port !== null) {
+            // Convenience: LiveStatusClient('host', port)
+            $this->connection_type = 'tcp';
+            $this->tcp_host        = $socket_path_or_host;
+            $this->tcp_port        = (int) $tcp_port;
+            $this->socket_path     = null;
+        } elseif (strncasecmp($socket_path_or_host, 'tcp://', 6) === 0) {
+            // Explicit tcp:// URI
+            $parsed = parse_url($socket_path_or_host);
+            if (!$parsed || empty($parsed['host'])) {
+                throw new LiveStatusException(
+                    "Invalid TCP URI: {$socket_path_or_host}",
+                    500
+                );
+            }
+            $this->connection_type = 'tcp';
+            $this->tcp_host        = $parsed['host'];
+            $this->tcp_port        = isset($parsed['port']) ? (int) $parsed['port'] : 6557;
+            $this->socket_path     = null;
+        } else {
+            // Original Unix-socket path
+            $this->connection_type = 'unix';
+            $this->socket_path     = $socket_path_or_host;
+            $this->tcp_host        = null;
+            $this->tcp_port        = null;
+        }
+
+        $this->socket       = null;
+        $this->query        = null;
         $this->pretty_print = false;
+        $this->timeout      = 10; // seconds; applies to TCP connections
     }
 
+    /**
+     * Open the socket connection (Unix or TCP).
+     */
     private function _connect()
     {
-        $this->socket = stream_socket_client("unix://{$this->socket_path}");
+        $errno  = 0;
+        $errstr = '';
+
+        if ($this->connection_type === 'tcp') {
+            $address = "tcp://{$this->tcp_host}:{$this->tcp_port}";
+            $this->socket = stream_socket_client(
+                $address,
+                $errno,
+                $errstr,
+                $this->timeout
+            );
+            if (!$this->socket) {
+                throw new LiveStatusException(
+                    "TCP connection to {$address} failed: {$errstr}",
+                    503
+                );
+            }
+            stream_set_timeout($this->socket, $this->timeout);
+        } else {
+            $this->socket = stream_socket_client(
+                "unix://{$this->socket_path}",
+                $errno,
+                $errstr,
+                $this->timeout
+            );
+            if (!$this->socket) {
+                throw new LiveStatusException(
+                    "Unix socket connection to {$this->socket_path} failed: {$errstr}",
+                    503
+                );
+            }
+        }
     }
 
     private function _jsonOpts()
@@ -29,9 +102,9 @@ class LiveStatusClient
     private function _parseResponse($response)
     {
         $response = json_decode($response);
-        $results = [];
+        $results  = [];
 
-        if ($this->query->stats) { 
+        if ($this->query->stats) {
             $results = $response;
         } else {
             $cols = $this->query->columns;
@@ -41,7 +114,7 @@ class LiveStatusClient
             }
 
             foreach ($response as $row) {
-                $results[] = array_combine($cols,$row);
+                $results[] = array_combine($cols, $row);
             }
         }
 
@@ -51,15 +124,16 @@ class LiveStatusClient
     private function _fetchResponse()
     {
         $response = '';
-        $status = 500;
+        $status   = 500;
+
         if ($status_line = fgets($this->socket)) {
-            list($status,$length) = explode(' ', $status_line);
+            list($status, $length) = explode(' ', $status_line);
 
             while ($line = fgets($this->socket)) {
                 $response .= $line;
             }
-
         }
+
         if ($status != 200) {
             throw new LiveStatusException($response, $status);
         }
@@ -70,21 +144,27 @@ class LiveStatusClient
     public function runQuery($query)
     {
         $this->_connect();
-        $this->query = $query;
-
+        $this->query  = $query;
         $query_string = $query->getQueryString();
+
         fwrite($this->socket, $query_string);
         $response = $this->_fetchResponse();
         fclose($this->socket);
+
         return $response;
     }
 
-    public function verify_post_request() {
+    public function verify_post_request()
+    {
         // Defined in index.php.
         global $request_method;
+
         if ($request_method != "POST") {
             header('Allow: POST');
-            throw new LiveStatusException("Invalid request method: {$request_method}. Use POST instead.", "405");
+            throw new LiveStatusException(
+                "Invalid request method: {$request_method}. Use POST instead.",
+                "405"
+            );
         }
     }
 
@@ -92,82 +172,92 @@ class LiveStatusClient
     {
         $this->verify_post_request();
         $command_string = $command->getCommandString();
+
         $this->_connect();
         fwrite($this->socket, $command_string);
         fclose($this->socket);
     }
 
-    function getQuery($action,$args=[])
+    function getQuery($action, $args = [])
     {
         $query = new LiveStatusQuery($action);
 
-        foreach ($args  as $key => $val) {
+        foreach ($args as $key => $val) {
             switch ($key) {
-            case 'Columns':
-                $columns = explode(',', $val);
-                $query->setColumns($columns);
-                break;
-            case 'Filter':
-                if (is_array($val)) {
-                    foreach ($val as $subvalue) {
-                        $query->addFilter($subvalue);
+                case 'Columns':
+                    $columns = explode(',', $val);
+                    $query->setColumns($columns);
+                    break;
+
+                case 'Filter':
+                    if (is_array($val)) {
+                        foreach ($val as $subvalue) {
+                            $query->addFilter($subvalue);
+                        }
+                    } else {
+                        $query->addFilter($val);
                     }
-                } else {
-                    $query->addFilter($val);
-                }
-                break;
-            case 'Stats':
-                if (is_array($val)) {
-                    foreach ($val as $subvalue) {
-                        $query->addStat($subvalue);
+                    break;
+
+                case 'Stats':
+                    if (is_array($val)) {
+                        foreach ($val as $subvalue) {
+                            $query->addStat($subvalue);
+                        }
+                    } else {
+                        $query->addStat($val);
                     }
-                } else {
-                    $query->addStat($val);
-                }
-                break;
-            default:
-                $query->setOption($key, $val);
+                    break;
+
+                default:
+                    $query->setOption($key, $val);
             }
         }
+
         return $this->runQuery($query);
     }
 
-    public function acknowledgeProblem($args) {
+    public function acknowledgeProblem($args)
+    {
         $cmd = new AcknowledgeCommand($args);
         $this->runCommand($cmd);
     }
-    
-    public function cancelDowntime($args) {
+
+    public function cancelDowntime($args)
+    {
         $cmd = new CancelDowntimeCommand($args);
         $this->runCommand($cmd);
     }
 
-    public function scheduleDowntime($args) {
+    public function scheduleDowntime($args)
+    {
         $cmd = new ScheduleDowntimeCommand($args);
         $this->runCommand($cmd);
     }
 
-    public function disableNotifications($args) {
+    public function disableNotifications($args)
+    {
         $cmd = new DisableNotificationsCommand($args);
         $this->runCommand($cmd);
     }
 
-    public function enableNotifications($args) {
+    public function enableNotifications($args)
+    {
         $cmd = new EnableNotificationsCommand($args);
         $this->runCommand($cmd);
     }
-
 }
 
 class LiveStatusQuery
 {
-    function __construct($topic, $options=[], $columns=[])
+    function __construct($topic, $options = [], $columns = [])
     {
-        $this->topic = $topic;
+        $this->topic   = $topic;
         $this->columns = $columns;
         $this->filters = [];
-        $this->stats = [];
-        $this->options['OutputFormat'] = 'json';
+        $this->stats   = [];
+
+        $this->options['OutputFormat']  = 'json';
         $this->options['ResponseHeader'] = 'fixed16';
     }
 
@@ -193,15 +283,15 @@ class LiveStatusQuery
 
     public function getQueryString()
     {
-        $query = [];
-
+        $query   = [];
         $query[] = "GET {$this->topic}";
+
         if ($this->columns) {
-                $cols = (array) $this->columns;
-                $cols = array_filter($cols, 'strlen');
-                if ($cols) {
-                   $query[] = "Columns: " . join(' ', $cols);
-                }
+            $cols = (array) $this->columns;
+            $cols = array_filter($cols, 'strlen');
+            if ($cols) {
+                $query[] = "Columns: " . join(' ', $cols);
+            }
         }
 
         foreach ($this->filters as $filter) {
@@ -218,29 +308,27 @@ class LiveStatusQuery
 
         $query[] = "\n";
 
-        return is_array($query) ? join("\n", $query) : (string)$query;
-
+        return is_array($query) ? join("\n", $query) : (string) $query;
     }
 }
 
 abstract class LiveStatusCommand
 {
-    function __construct($args=[])
+    function __construct($args = [])
     {
-        $this->action = '';
-        $this->args   = $args;
+        $this->action   = '';
+        $this->args     = $args;
         $this->required = [];
-        $this->fields = [];
+        $this->fields   = [];
     }
-
 
     private function _validateArgs()
     {
         foreach ($this->required as $field) {
             if (!array_key_exists($field, $this->args)) {
-		error_log("missing $field");
+                error_log("missing $field");
                 throw new LiveStatusException(
-                    "Required field '$field' is missing", 
+                    "Required field '$field' is missing",
                     400
                 );
             }
@@ -261,35 +349,37 @@ abstract class LiveStatusCommand
     {
         $this->_validateArgs();
         $this->_processArgs();
-        $command = "COMMAND ";
+
+        $command  = "COMMAND ";
         $command .= sprintf("[%d] ", time());
         $command .= "{$this->action};";
         $command .= join($this->args, ';');
         $command .= "\n\n";
+
         return $command;
     }
 }
 
 class AcknowledgeCommand extends LiveStatusCommand
 {
-    function __construct($args=[])
+    function __construct($args = [])
     {
         parent::__construct($args);
-        $this->action = 'ACKNOWLEDGE_SVC_PROBLEM';
+
+        $this->action   = 'ACKNOWLEDGE_SVC_PROBLEM';
         $this->required = [
             'host',
             'author',
             'comment',
         ];
-
         $this->fields = [
-            'host' => '',
-            'service' => '',
-            'sticky'    => 1,
-            'notify'    => 1,
-            'persistent'=> 1,
-            'author'    => '',
-            'comment'   => '',
+            'host'       => '',
+            'service'    => '',
+            'sticky'     => 1,
+            'notify'     => 1,
+            'persistent' => 1,
+            'author'     => '',
+            'comment'    => '',
         ];
     }
 
@@ -306,17 +396,17 @@ class AcknowledgeCommand extends LiveStatusCommand
 
 class CancelDowntimeCommand extends LiveStatusCommand
 {
-    function __construct($args=[])
+    function __construct($args = [])
     {
         parent::__construct($args);
-        $this->action = 'DEL_HOST_DOWNTIME';
+
+        $this->action   = 'DEL_HOST_DOWNTIME';
         $this->required = [
             'downtime_id'
         ];
-
         $this->fields = [
-            'downtime_id'       => '',
-            'service'           => null,
+            'downtime_id' => '',
+            'service'     => null,
         ];
     }
 
@@ -332,16 +422,16 @@ class CancelDowntimeCommand extends LiveStatusCommand
 
 class ScheduleDowntimeCommand extends LiveStatusCommand
 {
-    function __construct($args=[])
+    function __construct($args = [])
     {
         parent::__construct($args);
-        $this->action = 'SCHEDULE_SVC_DOWNTIME';
+
+        $this->action   = 'SCHEDULE_SVC_DOWNTIME';
         $this->required = [
             'host',
             'author',
             'comment',
         ];
-
         $this->fields = [
             'host'       => '',
             'service'    => '',
@@ -365,17 +455,17 @@ class ScheduleDowntimeCommand extends LiveStatusCommand
         }
 
         $this->args['start_time'] = time();
-        $this->args['end_time'] = time() + $this->args['duration'];
-
+        $this->args['end_time']   = time() + $this->args['duration'];
     }
 }
 
 class DisableNotificationsCommand extends LiveStatusCommand
 {
-    function __construct($args=[])
+    function __construct($args = [])
     {
         parent::__construct($args);
-        $this->action = 'DISABLE_SVC_NOTIFICATIONS';
+
+        $this->action   = 'DISABLE_SVC_NOTIFICATIONS';
         $this->required = [
             'host',
         ];
@@ -384,9 +474,9 @@ class DisableNotificationsCommand extends LiveStatusCommand
         // for all the host's services. Its only valid value is 'all' and it's
         // not required/used by any external Nagios commands.
         $this->fields = [
-            'host'       => '',
-            'service'    => '',
-            'scope'      => '',
+            'host'    => '',
+            'service' => '',
+            'scope'   => '',
         ];
     }
 
@@ -396,7 +486,6 @@ class DisableNotificationsCommand extends LiveStatusCommand
 
         // Do we want to disable all services under the given host?
         if ($this->args['scope'] && $this->args['scope'] == "all") {
-            // Unset the 'service' arg if present; it's redundant in this context.
             unset($this->args['service']);
             $this->action = 'DISABLE_HOST_SVC_NOTIFICATIONS';
         } elseif (!$this->args['service']) {
@@ -408,10 +497,11 @@ class DisableNotificationsCommand extends LiveStatusCommand
 
 class EnableNotificationsCommand extends LiveStatusCommand
 {
-    function __construct($args=[])
+    function __construct($args = [])
     {
         parent::__construct($args);
-        $this->action = 'ENABLE_SVC_NOTIFICATIONS';
+
+        $this->action   = 'ENABLE_SVC_NOTIFICATIONS';
         $this->required = [
             'host',
         ];
@@ -420,9 +510,9 @@ class EnableNotificationsCommand extends LiveStatusCommand
         // for all the host's services. Its only valid value is 'all' and it's
         // not required/used by any external Nagios commands.
         $this->fields = [
-            'host'       => '',
-            'service'    => '',
-            'scope'      => '',
+            'host'    => '',
+            'service' => '',
+            'scope'   => '',
         ];
     }
 
@@ -432,7 +522,6 @@ class EnableNotificationsCommand extends LiveStatusCommand
 
         // Do we want to enable all services under the given host?
         if ($this->args['scope'] && $this->args['scope'] == "all") {
-            // Unset the 'service' arg if present; it's redundant in this context.
             unset($this->args['service']);
             $this->action = 'ENABLE_HOST_SVC_NOTIFICATIONS';
         } elseif (!$this->args['service']) {
